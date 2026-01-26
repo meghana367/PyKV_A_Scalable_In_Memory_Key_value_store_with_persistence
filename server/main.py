@@ -22,7 +22,7 @@ async def broadcast_to_followers(command_str):
         return
 
     msg = f"{command_str}\n".encode()
-    for writer in connected_followers[:]:  # Iterate over a copy
+    for writer in connected_followers[:]:  # Iterate over a copy to safely remove disconnected ones
         try:
             writer.write(msg)
             await writer.drain()
@@ -57,42 +57,47 @@ async def handle_client(reader, writer):
                 connected_followers.append(writer)
                 writer.write(b"ACK_REPLICATION\n")
                 await writer.drain()
-                return  # Stay connected but stop processing as a standard client
+                return  # Stay connected as a broadcast target, stop parsing commands here
 
             # --- STANDARD COMMANDS ---
+            
             # 1. SET <key> <value> [EX <seconds>]
             if command == "SET" and len(parts) >= 3:
                 key = parts[1]
                 ttl = None
                 parts_upper = [p.upper() for p in parts]
+                
                 if "EX" in parts_upper:
                     try:
                         ex_index = parts_upper.index("EX")
                         ttl = int(parts[ex_index + 1])
+                        # Value is everything between the key and the EX flag
                         value = " ".join(parts[2:ex_index])
                     except (ValueError, IndexError):
+                        # Fallback if EX is present but malformed
                         value = " ".join(parts[2:])
                 else:
                     value = " ".join(parts[2:])
 
                 await store.set(key, value, ttl)
-                await broadcast_to_followers(message) # Broadcast write
+                await broadcast_to_followers(message) # Broadcast full command string to followers
                 response = "OK"
 
             # 2. GET <key>
             elif command == "GET" and len(parts) == 2:
                 key = parts[1]
                 val = await store.get(key)
+                # If key is expired or missing, store.get returns None
                 response = val if val is not None else "(nil)"
 
             # 3. INCR <key>
             elif command == "INCR" and len(parts) == 2:
                 key = parts[1]
                 result = await store.increment(key)
-                await broadcast_to_followers(message) # Broadcast write
+                await broadcast_to_followers(message)
                 response = str(result)
 
-            # 4. INFO
+            # 4. INFO (Internal Statistics)
             elif command == "INFO":
                 response = store.get_info()
 
@@ -101,10 +106,10 @@ async def handle_client(reader, writer):
                 key = parts[1]
                 success = await store.delete(key)
                 if success:
-                    await broadcast_to_followers(message) # Broadcast write
+                    await broadcast_to_followers(message)
                 response = "OK" if success else "(nil)"
 
-            # Send response to client
+            # Send response back to the client
             writer.write(f"{response}\n".encode())
             await writer.drain()
 
@@ -118,7 +123,7 @@ async def handle_client(reader, writer):
 
 async def compaction_housekeeper(interval=30):
     """
-    Background Task: Automatically triggers AOF compaction.
+    Background Task: Periodically triggers AOF compaction to optimize file size.
     """
     while True:
         await asyncio.sleep(interval)
@@ -130,24 +135,33 @@ async def compaction_housekeeper(interval=30):
             print(f"[Server] Compaction error: {e}")
 
 async def main():
-    # Use port 8889 as per your recent update
     server = await asyncio.start_server(handle_client, '127.0.0.1', 8889)
     addr = server.sockets[0].getsockname()
     print(f"[Server] PyKV LEADER ACTIVE on {addr}")
 
-    # Start background tasks
-    #cleanup_task = asyncio.create_task(store.cleanup_expired_keys())
+    # 1. Start background tasks and keep a reference to them
+    cleanup_task = asyncio.create_task(store.cleanup_expired_keys())
     compaction_task = asyncio.create_task(compaction_housekeeper(interval=30))
     
-    async with server:
-        try:
+    try:
+        async with server:
             await server.serve_forever()
-        finally:
-            #cleanup_task.cancel()
-            compaction_task.cancel()
+    except asyncio.CancelledError:
+        # This happens when the server is being shut down
+        pass
+    finally:
+        # 2. PROPER CLEANUP: Tell background tasks to stop
+        print("[Server] Stopping background tasks...")
+        cleanup_task.cancel()
+        compaction_task.cancel()
+        
+        # 3. Wait a tiny bit for them to acknowledge the cancellation
+        await asyncio.gather(cleanup_task, compaction_task, return_exceptions=True)
+        print("[Server] Cleanup complete.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[Server] Shutting down...")
+        # This is now handled silently
+        pass

@@ -6,8 +6,8 @@ from persistence.aof_logger import AOFLogger
 class LRUCache:
     def __init__(self, capacity: int = 10):
         self.capacity = capacity
-        self.db = {}      # The actual database (Stores ALL keys)
-        self.cache = {}   # The "Hot" Cache (Points to nodes in the Linked List)
+        self.db = {}       # The actual database (Stores ALL keys)
+        self.cache = {}    # The "Hot" Cache (Points to nodes in the Linked List)
         self.expiries = {} # Stores expiration timestamps: {key: timestamp}
         
         # Linked List for LRU (The Hot Zone)
@@ -28,17 +28,30 @@ class LRUCache:
         self._replay_aof()
 
     def _replay_aof(self):
-        """Rebuilds the full database state from disk on startup."""
+        """Rebuilds the full database state and TTLs from disk on startup."""
         logs = self.aof.read_logs()
         for line in logs:
             parts = line.split()
             if not parts: continue
             cmd = parts[0].upper()
+            
             if cmd == "SET" and len(parts) >= 3:
-                # Basic replay: key, value. 
-                self.db[parts[1]] = parts[2]
+                key, value = parts[1], parts[2]
+                self.db[key] = value
+                
+                # Rebuild TTL if EX was in the log
+                parts_upper = [p.upper() for p in parts]
+                if "EX" in parts_upper:
+                    try:
+                        ex_idx = parts_upper.index("EX")
+                        ttl = int(parts[ex_idx + 1])
+                        self.expiries[key] = time.time() + ttl
+                    except (ValueError, IndexError):
+                        pass
+                        
             elif cmd == "DEL" and len(parts) >= 2:
                 self.db.pop(parts[1], None)
+                self.expiries.pop(parts[1], None)
 
     def get_all_valid_data(self):
         """Returns the entire database for compaction."""
@@ -60,23 +73,30 @@ class LRUCache:
         async with self.lock:
             self.stats["total_commands"] += 1
             
-            # 1. Check if key exists in DB and hasn't expired
+            # 1. Check if key exists in DB
             if key not in self.db:
                 return None
             
+            # 2. Lazy TTL Check (Crucial for "nil" return on expired keys)
             if key in self.expiries and time.time() > self.expiries[key]:
-                # Lazy deletion if we hit an expired key
-                await self.delete(key)
+                # Release lock to call delete safely or handle deletion internally
+                # To keep it simple and safe within the same lock:
+                self.db.pop(key, None)
+                self.expiries.pop(key, None)
+                if key in self.cache:
+                    node = self.cache.pop(key)
+                    self._remove_node(node)
+                await self.aof.log_command("DEL", key)
                 return None
 
-            # 2. Cache Hit Logic
+            # 3. Cache Hit Logic
             if key in self.cache:
                 self.stats["cache_hits"] += 1
                 self._remove_node(self.cache[key])
                 self._add_node(self.cache[key])
                 return self.cache[key].value
             
-            # 3. Cache Miss (Cold Hit - in DB but not Cache)
+            # 4. Cache Miss (Cold Hit - in DB but not Cache)
             self.stats["cache_misses"] += 1
             value = self.db[key]
             
@@ -109,7 +129,7 @@ class LRUCache:
                 self._remove_node(self.cache[key])
                 self._add_node(self.cache[key])
             
-            # Log to AOF
+            # Log to AOF with TTL if provided
             if ttl:
                 await self.aof.log_command("SET", key, value, "EX", ttl)
             else:
@@ -131,6 +151,7 @@ class LRUCache:
             return False
 
     async def increment(self, key: str):
+        # We call get() which already handles Lazy TTL
         val = await self.get(key)
         try:
             new_val = int(val or 0) + 1
@@ -146,10 +167,15 @@ class LRUCache:
             async with self.lock:
                 now = time.time()
                 keys_to_del = [k for k, exp in self.expiries.items() if now > exp]
-            
-            for key in keys_to_del:
-                await self.delete(key)
-                print(f"[TTL] Expired: {key}")
+                
+                for key in keys_to_del:
+                    self.db.pop(key, None)
+                    self.expiries.pop(key, None)
+                    if key in self.cache:
+                        node = self.cache.pop(key)
+                        self._remove_node(node)
+                    await self.aof.log_command("DEL", key)
+                    print(f"[TTL] Expired and removed from file: {key}")
 
     def get_info(self):
         return (
