@@ -4,7 +4,7 @@ import time
 from persistence.aof_logger import AOFLogger
 
 class LRUCache:
-    def __init__(self, capacity: int = 10):
+    def __init__(self, capacity: int = 5):
         self.capacity = capacity
         self.db = {}       # The actual database (Stores ALL keys)
         self.cache = {}    # The "Hot" Cache (Points to nodes in the Linked List)

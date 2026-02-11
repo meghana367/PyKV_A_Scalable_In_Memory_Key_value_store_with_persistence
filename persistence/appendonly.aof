@@ -1,6 +1,8 @@
-SET name meghana
-SET age 21
-SET user meghana
-SET user1 meghana
-SET user2 meghana
-SET temporary_key value
+SET id1 10
+SET id2 2
+SET id3 3
+SET id4 4
+SET id5 5
+SET id6 6
+SET id7 7
+SET age 20

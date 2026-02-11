@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.store import LRUCache
 
 # Initialize the store
-store = LRUCache(capacity=10)
+store = LRUCache(capacity=5)
 
 # List to keep track of active follower connections
 connected_followers = []
